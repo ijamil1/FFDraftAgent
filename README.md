@@ -1,0 +1,1 @@
+an LLM-based agent to assist in simulating, researching, and preparing for fantasy football draft
