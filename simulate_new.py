@@ -73,7 +73,9 @@ def run_sim(sim_id, num_teams, draft_rounds, pick, keepers_df, player_df):
                     top_10_players = available_indices[:10]
                     for row_index in top_10_players:
                         player_name = filtered_player_df.iloc[row_index]['Player']
-                        results_dict[draft_round].append(player_name)
+                        pos = filtered_player_df.iloc[row_index]['Position']
+                        adp = filtered_player_df.iloc[row_index]['ADP']
+                        results_dict[draft_round].append(player_name + '_' + pos + '_' + str(adp))
 
                 
                 generate_pick(team, draft_round, team_composition, team_rounds_picked, team_roster, filtered_player_df, selected_players_bool_arr)
@@ -146,7 +148,7 @@ def generate_pick(team, draft_round, team_composition, team_rounds_picked, team_
     if rb_wr_diff >= 2: #2 RBs more than WRs
         unavailable_positions.append('RB')
     
-    if draft_round <= 10 or (team_composition[team][Position.RB.value] < 4 and team_composition[team][Position.WR.value] < 4) or (team_composition[team][Position.QB.value] < 1) or (team_composition[team][Position.TE.value] < 1):
+    if (team_composition[team][Position.QB.value] < 1) or (team_composition[team][Position.TE.value] < 1):
         unavailable_positions += ['DST', 'K']
     
     available_positions_bool_arr = ~player_df['Position'].isin(unavailable_positions).to_numpy()
@@ -321,8 +323,10 @@ def main():
         sorted_dict = dict(sorted(shared_dict[draft_round].items(), key=lambda item: item[1], reverse=True))
         print(f"Most Likely Top 10 Players Available in Round {draft_round}:")
         if len(sorted_dict):
-            for player, count in list(sorted_dict.items())[:10]:
-                print(f"{player}, {round(count/num_sims*100, 2)}%, ADP: {player_df[player_df['Player'] == player]['ADP'].values[0]:.2f}")
+            for player_pos_adp, count in list(sorted_dict.items())[:10]:
+                player, pos, adp = player_pos_adp.split('_')
+                adp = float(adp)
+                print(f"{player}, {pos}, {round(count/num_sims*100, 2)}%, ADP: {adp:.2f}")
         else:
             print("Keeper used in this round")
         print('--------------------------------')
