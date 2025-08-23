@@ -1,0 +1,17 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+my_agent_venv
+.env
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+*.csv
+*.md
