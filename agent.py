@@ -13,27 +13,23 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 season = date.today().year
 
 # System prompt (configurable via env var AGENT_SYSTEM_PROMPT)
-SYSTEM_PROMPT =  f"You are a fantasy football expert who grounds opinions based on facts and news, and you have taken on the role of a helpful, concise assistant. Your goal is to help the user in the upcoming {season} fantasy football season. You can run draft simulations given some inputs from the user. You can help the user prepare for the draft and by answering their questions about the draft and the upcoming NFL season in general by getting the latest news, information, and outlook from the web. Whenever you do use the web, use the best sources for {season} fantasy football data like ESPN, CBS, Yahoo, and NFL.com, and PFF. Whenever the user asks about a specific player’s outlook, injury status, pros/cons, or fantasy projections, you must call the web_search tool before answering. Do not guess.\
-The typical flow of the conversation will be as follows: \
-1. The user will ask you to simulate a draft. \
-2. You will use the run_draft_simulation tool to simulate the draft and let the user know that the draft simulation has started and that it will take a few minutes. Also, let the user know that they should ask you to check the status of the draft simulation every few minutes but you can answer other questions about fantasy football in general in the meantime since the simulation is running in the background. \
-3. After every few questions that the user asks, the user may ask you to check the status of the draft simulation. You will use the get_simulation_status_and_results tool to check the status of the draft simulation. If the simulation is still running, let the user know and continue with the QA flow.\
-4. Once the draft simulation is complete, you will send the results of the draft simulation to the user. \
-5. The user will likely ask you follow up questions about the results of the draft simulation. You should use the web search tool to get the latest news, information, outlook, and projections from the web. Focus on pros and cons of each player (what is their upside and downside).  \
-6. The user may ask you to create a file with the results of the draft simulation.  You will use the create_file tool \
-    to create a file with the results of the draft simulation and the web search results, insights, and other information in a clean and readable format. This is basically a report that the user can use to make their draft decisions. Focus on what is being said about each player's upside and downsides and include it in the report. Give the user information that they can use to weigh the pros and cons of players against each other. Focus on what experts are saying. \
-\
-In regards to the available tools at your disposal:    \
+SYSTEM_PROMPT =  f"You are a fantasy football expert who grounds opinions based on facts and the latest news and projections, and you have taken on the role of a helpful, concise assistant. \
+Your goal is to help the user in the upcoming {season} fantasy football season. \
+You can run draft simulations given some inputs from the user. \
+You can help the user prepare for the draft and by answering their questions about the draft and the upcoming NFL season in general by getting the latest news, information, and outlook from the web. \
+You can save and write files to the local directory. \
+Whenever you do use the web, use the best sources for {season} fantasy football data like ESPN, CBS, Yahoo, and NFL.com, and PFF. \
+Whenever the user asks about a specific player’s outlook, injury status, pros/cons, or fantasy projections, you must call the web_search tool before answering. \
+Do not guess.\
 In additon to having web search enabled, you have access to the following tools: \
-    - run_draft_simulation: This function triggers a draft simulation to run asynchronously by launching a non-blocking process that runs the draft simulation script.  This function should be called when the user requests you to simulate a draft. Note, the user request might not directly \
+    - run_draft_simulation: This function triggers a draft simulation to run in the background.  This function should be called when the user requests you to simulate a draft. Note, the user request might not directly \
             use the words 'simulate' or 'draft' in their request. You, the agent, should be able to infer this when the user asks for predictions on who will be available in each round or something similar. \
             This function should NOT be called more than 1x unless the user explictly asks for a new simulation or adjusts the parameters of the simulation. If the user asks for more information on the results and/or players, the agent should use web search to get the information. If you are unsure about whether the user is asking for a new simulation or not, ask the user to confirm their request.\
-    - get_simulation_status_and_results: This function should be used to retrieve the status and/or results of the draft simulation. The draft simulations runs asynchronously so this function is \
-    used to check the status of the simulation that is running in the background. Call this function when the user is asking for the status of the draft simulation or wants to know if the draft simulation is complete or is asking for the results of the draft simulation. This function \
+    - get_simulation_status_and_results: This function should be used to retrieve the status and/or results of the draft simulation. This function is \
+    used to check the status of the simulation that is running in the background. Call this function when the user is asking for the status or results of the draft simulation. This function \
     should only be called if run_draft_simulation has been called earlier. \
-    - create_file: This function creates a new local file. It should only be called if the user explicitly asks the agent to create a file or save the insights and simulation results. \
-        Do NOT call this function more than a few times.\
-Note that you can only call one tool per turn."
+    - create_file: This function creates a new local file. It should only be called if the user explicitly asks the agent to create a file or save data, results, or insights. \
+        Don't call this function more than 2-3 times max."
 
 # ------------------------------
 # Job Management
@@ -113,15 +109,15 @@ custom_tools = [
     {
         "type": "function",
         "name": "run_draft_simulation",
-        "description": "This function triggers a draft simulation to run asynchronously by launching a non-blocking process that runs the python simulation script. \
+        "description": "This function triggers a draft simulation to run in the background. \
             This function returns a dict with 2 keys: job_id and status. The status key will have a value of 'started' until the simulation is complete. The agent WILL NEED the job_id (string) later to get the results of the draft simulation. This function's parameters are inferred from the user's input. \
-            The purpose of this function is to enable the user to get an idea of the best players available to draft in each round. \
+            The purpose of this function is to enable the user to get an idea of the best players available to draft in each round. It basically runs an automated mock draft. \
             \
             The function should be called with the following parameters: \
             num_teams: Number of teams in the user's league (REQUIRED) \
             pick: The user's draft pick position (REQUIRED) \
             draft_rounds: Number of rounds in the draft (REQUIRED) \
-            adp_csv_file: Absolute filename for player data in CSV format (OPTIONAL); if provided, the csv schema must be: 'Rank (int), Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order. \
+            adp_csv_file: Absolute filename for player data in CSV format (REQUIRED); the csv schema must be: 'Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order. \
             keepers_csv_file: Absolute filename for keepers data in CSV format (OPTIONAL); if provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive). \
             num_sims: Number of draft simulations to run (OPTIONAL) \
             \
@@ -133,7 +129,7 @@ custom_tools = [
                 "num_teams": {"type": "integer", "description": "Number of teams in the user's league (ie: 14)"},
                 "pick": {"type": "integer", "description": "The user's draft pick position (ie: 1)"},
                 "draft_rounds": {"type": "integer", "description": "Number of rounds in the draft (ie: 14)"},
-                "adp_csv_file": {"type": "string", "description": "Absolute filename for player data in CSV format; if provided, the csv schema must be: 'Rank (int), Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order."},
+                "adp_csv_file": {"type": "string", "description": "Absolute filename for player data in CSV format; the csv schema must be: 'Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order."},
                 "keepers_csv_file": {"type": "string", "description": "Absolute filename for keepers data in CSV format; if provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive)."},
                 "num_sims": {"type": "integer", "description": "Number of draft simulations to run (ie: 2000)"},
             },
@@ -143,8 +139,8 @@ custom_tools = [
     {
         "type": "function",
         "name": "get_simulation_status_and_results",
-        "description": "This function should be used to retrieve the status and/or results of the draft simulation. The draft simulations runs asynchronously so this function is \
-            used to check the status of the simulation that is running in another process. \
+        "description": "This function should be used to retrieve the status and/or results of the draft simulation. This function is \
+            used to check the status of the simulation that is running in the background. \
             The parameter for this function is the job_id (string) returned by the run_draft_simulation function. \
             This function returns a dict. If the only key in the dict is 'error', it means that an incorrect job_id was passed in. \
             If the status key is present and has a value of 'running', it means that the simulation is still in progress so let the user know that the simulation is still running. \
@@ -207,7 +203,7 @@ custom_tools = [
             file_path: The absolute path to the file to be created (required) \
             new_content: The content to be written to the file (required) \
             Note, that the file_path should be an absolute filepath provided by the user in the user's input. Do NOT make up a file_path on your own. \
-            The new_content parameter should be a summary of the insights that you, the agent, have provided for the user. If the draft simulation is complete, the new_content parameter should contain the results of the draft as well as summarize the insights, news, and other information that you have gathered and provided to the user. \
+            Prior to populating new content, be sure to know exactly what the user wants to write and how it should be formatted. \
             Do NOT call this function more than a few times. This function returns a dict with a key for status. \
             If the value of the status key does not contain the word 'successfully', it means that the file was not created successfully. The message should be sent to the user. \
             If the value of the status key contains the word 'successfully', it means that the file was created successfully. The message should be sent to the user.",

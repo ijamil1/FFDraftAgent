@@ -140,12 +140,13 @@ def generate_pick(team, draft_round, team_composition, team_rounds_picked, team_
     pos_slots_avail = np.array(TEAM_COMPOSITION) - np.array(team_composition[team])
     indices = np.where(pos_slots_avail == 0)[0]
     unavailable_positions = [Position(i).name for i in indices]
-    if team_composition[team][Position.RB.value] <= 1 and team_composition[team][Position.WR.value] >= 3:
+    rb_wr_diff = team_composition[team][Position.RB.value] - team_composition[team][Position.WR.value]
+    if rb_wr_diff <= -2: #2 WRs more than RBs
         unavailable_positions.append('WR')
-    if team_composition[team][Position.RB.value] >= 3 and team_composition[team][Position.WR.value] <= 1:
+    if rb_wr_diff >= 2: #2 RBs more than WRs
         unavailable_positions.append('RB')
     
-    if team_composition[team][Position.RB.value] < 3 or team_composition[team][Position.WR.value] < 3:
+    if draft_round <= 10 or (team_composition[team][Position.RB.value] < 4 and team_composition[team][Position.WR.value] < 4) or (team_composition[team][Position.QB.value] < 1) or (team_composition[team][Position.TE.value] < 1):
         unavailable_positions += ['DST', 'K']
     
     available_positions_bool_arr = ~player_df['Position'].isin(unavailable_positions).to_numpy()
