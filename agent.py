@@ -25,11 +25,19 @@ In additon to having web search enabled, you have access to the following tools:
     - run_draft_simulation: This function triggers a draft simulation to run in the background.  This function should be called when the user requests you to simulate a draft. Note, the user request might not directly \
             use the words 'simulate' or 'draft' in their request. You, the agent, should be able to infer this when the user asks for predictions on who will be available in each round or something similar. \
             This function should NOT be called more than 1x unless the user explictly asks for a new simulation or adjusts the parameters of the simulation. If the user asks for more information on the results and/or players, the agent should use web search to get the information. If you are unsure about whether the user is asking for a new simulation or not, ask the user to confirm their request.\
+            There is some nuance to calling this function in regards to the adp_csv_file. The adp_csv_file parameter is the absolute filepath of the file that contains the average draft position data for players. It is essential for the simulation. BUT, I want to let the user either provide the absolute path OR let you, the agent, create the file after web searching for the data. \
+            If the user provides the filepath, use it directly as the adp_csv_file parameter. \
+            If not, confirm with the user that you will do a web search youself. The web search needs to retrieve the player name, average draft position, and position for AT LEAST 200 players for the upcoming {season} fantasy football season. Get ADP data from ONE reputable source like ESPN, CBS, Yahoo, and NFL.com, or PFF. You should use the create_file tool to create a new csv file with the adp data. \
+            Be mindful of the required schema of the adp_csv_file. The csv schema must be: 'Player (str), ADP (float), Position (str)'. 'Position' is one of: QB, RB, WR, TE, K, DST. \
+            Choose a relevant filename for the adp_csv_file, write the content, and use the absolute filepath of the file containing the data you just wrote as the adp_csv_file parameter. This path can be found in the status key of the dict returned from the create_file tool. \
+            Always confirm the parameters of this function with the user before calling it. \
     - get_simulation_status_and_results: This function should be used to retrieve the status and/or results of the draft simulation. This function is \
     used to check the status of the simulation that is running in the background. Call this function when the user is asking for the status or results of the draft simulation. This function \
     should only be called if run_draft_simulation has been called earlier. \
-    - create_file: This function creates a new local file. It should only be called if the user explicitly asks the agent to create a file or save data, results, or insights. \
-        Don't call this function more than 2-3 times max."
+    - create_file: This function creates a new local file. It should only be called if the user explicitly asks the agent to create a file, save data, results, or insights, or as part of saving data for the draft simulation as csv files. \
+            It is passed 2 parameters: filename and new_content. Usually, the filename should be a filename provided by the user. Otherwise, if not provided, choose a filename that is relevant given the context of the conversation and the content being written. \
+            Prior to populating new content, be sure to know exactly what the user wants to write and how it should be formatted. \
+            Don't call this function haphazardly. Be intentional about calling this function."
 
 # ------------------------------
 # Job Management
@@ -70,26 +78,20 @@ def get_simulation_status_and_results(job_id):
         return {"status": "running"}
     return {"status": "done", "result": job["result"]}
 
-
-
-def create_file(file_path, new_content):
-    abs_path = os.path.realpath(file_path)  # resolves symlinks fully
-    cwd = os.path.realpath(os.getcwd())
-
-    # Ensure inside current directory
-    if not abs_path.startswith(cwd + os.sep):
-        return {"status": "Cannot create file outside current directory"}
-
+def create_file(filename, new_content):
+    
+    file_path = os.path.join(os.getcwd(), filename)
+    
     # Prevent overwriting
     try:
-        fd = os.open(abs_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(file_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         return {"status": f"Cannot overwrite existing file {file_path}"}
 
     # Check allowed extensions
-    if not abs_path.endswith(('.txt', '.md')):
+    if not file_path.endswith(('.txt', '.md', '.csv')):
         os.close(fd)
-        return {"status": "Only .txt and .md files are allowed"}
+        return {"status": "Only .txt, .md, and .csv files are allowed"}
 
     # Write content (with limit)
     if len(new_content) > 1_000_000:  # limit to 1MB
@@ -99,7 +101,7 @@ def create_file(file_path, new_content):
     with os.fdopen(fd, "w") as f:
         f.write(new_content)
 
-    return {"status": f"File {file_path} written successfully."}
+    return {"status": f"File {filename} written successfully in the current directory with the absolute path: {file_path}."}
 
 
 # ------------------------------
@@ -118,7 +120,7 @@ custom_tools = [
             pick: The user's draft pick position (REQUIRED) \
             draft_rounds: Number of rounds in the draft (REQUIRED) \
             adp_csv_file: Absolute filename for player data in CSV format (REQUIRED); the csv schema must be: 'Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order. \
-            keepers_csv_file: Absolute filename for keepers data in CSV format (OPTIONAL); if provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive). \
+            keepers_csv_file: Absolute filename for keepers data in CSV format (OPTIONAL). If provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive). \
             num_sims: Number of draft simulations to run (OPTIONAL) \
             \
             Ensure that the parameters of this function are extracted from the user's input. Do NOT make them up on your own. If the user is trying to run the simulation without providing the necessary parameters, let them know and ask them to provide the necessary parameters.",
@@ -200,20 +202,18 @@ custom_tools = [
         "type": "function",
         "name": "create_file",
         "description": "This function creates a new local file. The function should be called with the following parameters: \
-            file_path: The absolute path to the file to be created (required) \
+            filename: The name of the file to be created (required) \
             new_content: The content to be written to the file (required) \
-            Note, that the file_path should be an absolute filepath provided by the user in the user's input. Do NOT make up a file_path on your own. \
-            Prior to populating new content, be sure to know exactly what the user wants to write and how it should be formatted. \
-            Do NOT call this function more than a few times. This function returns a dict with a key for status. \
+            This function returns a dict with a key for status. \
             If the value of the status key does not contain the word 'successfully', it means that the file was not created successfully. The message should be sent to the user. \
-            If the value of the status key contains the word 'successfully', it means that the file was created successfully. The message should be sent to the user.",
+            If the value of the status key contains the word 'successfully', it means that the file was created successfully. The message should be sent to the user; the message should include the absolute path of the file that was created.",
         "parameters": {
             "type": "object",
             "properties": {
-                "file_path": {"type": "string"},
+                "filename": {"type": "string"},
                 "new_content": {"type": "string"}
             },
-            "required": ["file_path", "new_content"]
+            "required": ["filename", "new_content"]
         }
     }
 ]
@@ -259,7 +259,12 @@ def agent_chat():
             break
 
         conversation.append({"role": "user", "content": user_input})
-  
+
+        for m in conversation:
+            if hasattr(m, 'type') and( m.type == 'function_call' or m.type == 'function_call_output'):
+                print(m)
+                print("\n")
+
         # Call the Responses API
         response = client.responses.create(
             model="gpt-5-mini",
@@ -298,6 +303,7 @@ def agent_chat():
                     raise ValueError(f"Invalid tool name: {tool_name}")
 
                 # Append tool output to conversation
+                
                 conversation.append({
                     "type": "function_call_output",
                     "call_id": call_id,
