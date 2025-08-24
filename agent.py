@@ -30,7 +30,7 @@ In additon to having web search enabled, you have access to the following tools:
             If not, confirm with the user that you will do a web search youself. The web search needs to retrieve the player name, average draft position, and position for AT LEAST 200 players for the upcoming {season} fantasy football season. Get ADP data from ONE reputable source like ESPN, CBS, Yahoo, and NFL.com, or PFF. You should use the create_file tool to create a new csv file with the adp data. \
             Be mindful of the required schema of the adp_csv_file. The csv schema must be: 'Player (str), ADP (float), Position (str)'. 'Position' is one of: QB, RB, WR, TE, K, DST. \
             Choose a relevant filename for the adp_csv_file, write the content, and use the absolute filepath of the file containing the data you just wrote as the adp_csv_file parameter. This path can be found in the status key of the dict returned from the create_file tool. \
-            Always confirm the parameters of this function with the user before calling it. \
+            \
     - get_simulation_status_and_results: This function should be used to retrieve the status and/or results of the draft simulation. This function is \
     used to check the status of the simulation that is running in the background. Call this function when the user is asking for the status or results of the draft simulation. This function \
     should only be called if run_draft_simulation has been called earlier. \
@@ -123,7 +123,7 @@ custom_tools = [
             keepers_csv_file: Absolute filename for keepers data in CSV format (OPTIONAL). If provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive). \
             num_sims: Number of draft simulations to run (OPTIONAL) \
             \
-            Ensure that the parameters of this function are extracted from the user's input. Do NOT make them up on your own. If the user is trying to run the simulation without providing the necessary parameters, let them know and ask them to provide the necessary parameters.",
+            Ensure that the parameters of this function are extracted from the user's input. If the user is trying to run the simulation without providing the necessary parameters, let them know and ask them to provide the necessary parameters.",
 
         "parameters": {
             "type": "object",
@@ -260,77 +260,50 @@ def agent_chat():
 
         conversation.append({"role": "user", "content": user_input})
 
-        for m in conversation:
-            if hasattr(m, 'type') and( m.type == 'function_call' or m.type == 'function_call_output'):
-                print(m)
-                print("\n")
-
         # Call the Responses API
-        response = client.responses.create(
-            model="gpt-5-mini",
-            input=conversation,
-            tools=tools
-        )
-        
-        conversation += response.output
-        assistant_message = ""
-        function_call = False
-        for o in response.output:
-            if hasattr(o, 'type') and o.type == 'message':
-                content = o.content
-                for c in content:
-                    if hasattr(c, 'type') and c.type == 'output_text':
-                        assistant_message += c.text
-                        print("Agent:", assistant_message)
-                        print("\n")
-
-            elif hasattr(o, 'type') and o.type == 'function_call':
-                function_call = True
-                tool_name = o.name
-                tool_args = json.loads(o.arguments)
-                call_id = o.call_id
-
-                print(f"System: Agent wants to call: {tool_name} with args {tool_args}")
-
-
-                if tool_name == "run_draft_simulation":
-                    tool_result = run_draft_simulation(**tool_args)
-                elif tool_name == "get_simulation_status_and_results":
-                    tool_result = get_simulation_status_and_results(**tool_args)
-                elif tool_name == "create_file":
-                    tool_result = create_file(**tool_args)
-                else:
-                    raise ValueError(f"Invalid tool name: {tool_name}")
-
-                # Append tool output to conversation
-                
-                conversation.append({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": json.dumps(tool_result)
-                })
-        
-        # Ask model to reason about the tool output
-        if function_call:
-            followup = client.responses.create(
+        done = False
+        while not done:
+            response = client.responses.create(
                 model="gpt-5-mini",
                 input=conversation,
-                tools=tools,
-                instructions=f"Reason about the tool output and the context of the conversation and respond appropriately to the user"
+                tools=tools
             )
 
-            followup_message = ""
-            for o in followup.output:
-                if hasattr(o, 'type') and o.type == 'message':
-                    content = o.content
-                    for c in content:
-                        if hasattr(c, 'type') and c.type == 'output_text':
-                            followup_message += c.text
+            new_tool_call = False
 
-            print("Agent:", followup_message)
-            print("\n")
-            conversation += followup.output
-        
+            for o in response.output:
+                if hasattr(o, "type") and o.type == "message":
+                    # handle assistant text
+                    content = "".join(c.text for c in o.content if hasattr(c, 'type') and c.type == 'output_text')
+                    if content:
+                        print("Agent:", content)
+
+                elif hasattr(o, "type") and o.type == "function_call":
+                    new_tool_call = True
+                    tool_name = o.name
+                    call_id = o.call_id
+                    tool_args = json.loads(o.arguments)
+                   
+
+                    print(f"System: Agent wants to call: {tool_name} with args {tool_args}")
+
+                    # run tool
+                    if tool_name == "run_draft_simulation":
+                        tool_result = run_draft_simulation(**tool_args)
+                    elif tool_name == "get_simulation_status_and_results":
+                        tool_result = get_simulation_status_and_results(**tool_args)
+                    elif tool_name == "create_file":
+                        tool_result = create_file(**tool_args)
+
+                    conversation.append({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps(tool_result)
+                    })
+
+            # if no new tool calls remain, we're done
+            if not new_tool_call:
+                done = True
 
 if __name__ == "__main__":
     agent_chat()
