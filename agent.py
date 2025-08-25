@@ -27,7 +27,7 @@ In additon to having web search enabled, you have access to the following tools:
             This function should NOT be called more than 1x unless the user explictly asks for a new simulation or adjusts the parameters of the simulation. If the user asks for more information on the results and/or players, the agent should use web search to get the information. If you are unsure about whether the user is asking for a new simulation or not, ask the user to confirm their request.\
             There is some nuance to calling this function in regards to the adp_csv_file. The adp_csv_file parameter is the absolute filepath of the file that contains the average draft position data for players. It is essential for the simulation. BUT, I want to let the user either provide the absolute path OR let you, the agent, create the file after web searching for the data. \
             If the user provides the filepath, use it directly as the adp_csv_file parameter. \
-            If not, confirm with the user that you will do a web search youself. The web search needs to retrieve the player name, average draft position, and position for AT LEAST 200 players for the upcoming {season} fantasy football season. Get ADP data from ONE reputable source like ESPN, CBS, Yahoo, and NFL.com, or PFF. You should use the create_file tool to create a new csv file with the adp data. \
+            If not, let the user know that you will do a web search youself. The web search needs to retrieve the player name, average draft position, and position for AT LEAST 200 players for the upcoming {season} fantasy football season. Get ADP data from ONE reputable source like ESPN, CBS, Yahoo, and NFL.com, or PFF. You should use the create_file tool to create a new csv file with the adp data. \
             Be mindful of the required schema of the adp_csv_file. The csv schema must be: 'Player (str), ADP (float), Position (str)'. 'Position' is one of: QB, RB, WR, TE, K, DST. \
             Choose a relevant filename for the adp_csv_file, write the content, and use the absolute filepath of the file containing the data you just wrote as the adp_csv_file parameter. This path can be found in the status key of the dict returned from the create_file tool. \
             \
@@ -263,6 +263,7 @@ def agent_chat():
         # Call the Responses API
         done = False
         while not done:
+            
             response = client.responses.create(
                 model="gpt-5-mini",
                 input=conversation,
@@ -272,6 +273,7 @@ def agent_chat():
             new_tool_call = False
 
             for o in response.output:
+                conversation.append(o)
                 if hasattr(o, "type") and o.type == "message":
                     # handle assistant text
                     content = "".join(c.text for c in o.content if hasattr(c, 'type') and c.type == 'output_text')
