@@ -4,6 +4,7 @@ import uuid
 import subprocess
 from threading import Thread
 from openai import OpenAI
+import itertools, sys, threading, time
 from dotenv import load_dotenv
 from datetime import date
 load_dotenv()
@@ -11,11 +12,13 @@ load_dotenv()
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 season = date.today().year
+llm_written_files = [] # list of files that the llm has written to the local directory
 
 # System prompt (configurable via env var AGENT_SYSTEM_PROMPT)
 SYSTEM_PROMPT =  f"You are a fantasy football expert who grounds opinions based on facts and the latest news and projections, and you have taken on the role of a helpful, concise assistant. \
 Your goal is to help the user in the upcoming {season} fantasy football season. \
 You can run draft simulations given some inputs from the user. \
+You can answer questions about the simulation design and intricacies. \
 You can help the user prepare for the draft and by answering their questions about the draft and the upcoming NFL season in general by getting the latest news, information, and outlook from the web. \
 You can save and write files to the local directory. \
 Whenever you do use the web, use the best sources for {season} fantasy football data like ESPN, CBS, Yahoo, and NFL.com, and PFF. \
@@ -27,8 +30,10 @@ In additon to having web search enabled, you have access to the following tools:
             This function should NOT be called more than 1x unless the user explictly asks for a new simulation or adjusts the parameters of the simulation. If the user asks for more information on the results and/or players, the agent should use web search to get the information. If you are unsure about whether the user is asking for a new simulation or not, ask the user to confirm their request.\
             There is some nuance to calling this function in regards to the adp_csv_file. The adp_csv_file parameter is the absolute filepath of the file that contains the average draft position data for players. It is essential for the simulation. BUT, I want to let the user either provide the absolute path OR let you, the agent, create the file after web searching for the data. \
             If the user provides the filepath, use it directly as the adp_csv_file parameter. \
-            If not, let the user know that you will do a web search youself. The web search needs to retrieve the player name, average draft position, and position for AT LEAST 200 players for the upcoming {season} fantasy football season. Get ADP data from ONE reputable source like ESPN, CBS, Yahoo, and NFL.com, or PFF. You should use the create_file tool to create a new csv file with the adp data. \
-            Be mindful of the required schema of the adp_csv_file. The csv schema must be: 'Player (str), ADP (float), Position (str)'. 'Position' is one of: QB, RB, WR, TE, K, DST. \
+            If not, let the user know that you will do a web search yourself to scrape the data. Be mindful of the required schema of the adp_csv_file. The csv schema must be: 'Player (str), ADP (float), Position (str)'. 'Position' is one of: QB, RB, WR, TE, K, DST. \
+            So, the web search needs to scrape the player name, average draft position, and position. It is CRITICAL that the web search retrieves data for AT LEAST 300 players for the upcoming {season} fantasy football season. Each position has a minimum number of players that have to be retrieved: QB: 14, RB: 70, WR: 70, TE: 14, K: 14, DST: 14. Ideally, more than the minimum number of players for each position are retrieved. The simulation may fail otherwise. \
+            Get ADP data from ONE reputable source like ESPN, CBS, Yahoo, and NFL.com, or PFF. You should use the create_file tool to create a new csv file with the adp data. Note, you need to format the data as a csv file but it doesn't need to natively be exported from the web as a csv file.\
+             \
             Choose a relevant filename for the adp_csv_file, write the content, and use the absolute filepath of the file containing the data you just wrote as the adp_csv_file parameter. This path can be found in the status key of the dict returned from the create_file tool. \
             \
     - get_simulation_status_and_results: This function should be used to retrieve the status and/or results of the draft simulation. This function is \
@@ -37,17 +42,53 @@ In additon to having web search enabled, you have access to the following tools:
     - create_file: This function creates a new local file. It should only be called if the user explicitly asks the agent to create a file, save data, results, or insights, or as part of saving data for the draft simulation as csv files. \
             It is passed 2 parameters: filename and new_content. Usually, the filename should be a filename provided by the user. Otherwise, if not provided, choose a filename that is relevant given the context of the conversation and the content being written. \
             Prior to populating new content, be sure to know exactly what the user wants to write and how it should be formatted. \
-            Don't call this function haphazardly. Be intentional about calling this function."
-
+            Don't call this function haphazardly. Be intentional about calling this function.\
+    - read_simulation_file: This function reads the simulate.py file which is the script that runs the draft simulation. This function should be called if the user asks for the intricacies of the simulation design. Use the contents of the file to give you context to answer the user's question.\
+    - append_file: This function appends content to a file that was previously created by the LLM. This function should be called if appending to a file is needed. \
+            The file_path parameter is the absolute path of the file to append to. The content_to_append parameter is the content to append to the file. \
+            This function should only be called if create_file has been successfully called earlier. You will need the absolute file path of the file that was returned in the value of the status key by create_file to append to it. \
+\
+Some user requests may involve very large research tasks and extensive web searches. \
+You are NOT responsible for automatically breaking down large tasks. \
+Instead, your role is to help the user manage large tasks effectively:\
+\
+1. If the user gives you a large or ambiguous task, suggest how they might break it into smaller, manageable chunks. \
+   - Example: “This task might be easier if we first do X, then Y, then Z. Would you like to start with X?” \
+   - Do not attempt to execute an entire massive task in one step.\
+\
+2. You have the ability to:\
+   - Write intermediate results or notes directly into the conversation. \
+   - Use tools like `append_file` or `create_file` to persist partial results or progress if the user wants them saved externally.\
+\
+3. Important: Be aware of how this system works.\
+   - If you do not call a tool during your turn, control of the conversation is automatically returned to the user. \
+   - Returning control before a task is complete or progress is persisted will result in permanent loss of progress.\
+\
+4. Therefore:\
+   - Always either (a) finish the requested task, or (b) persist intermediate progress before ending your turn. \
+   - If the user has given you a task that is too large for one step, clearly tell them so and suggest a breakdown strategy. \
+   - If you must return control before the task is finished, explicitly inform the user that the task is incomplete and how they can continue.\
+Never claim to run tasks in the background. Never silently drop progress."
 # ------------------------------
 # Job Management
 # ------------------------------
 jobs = {}
 
+
+def spinner(stop_event, msg="Thinking..."):
+    for c in itertools.cycle(['.', '..', '...']):
+        if stop_event.is_set():
+            sys.stdout.write('\r' + ' ' * (len(msg) + 3) + '\r')  # Clear the line before breaking
+            sys.stdout.flush()
+            break
+        sys.stdout.write(f"\r{msg}{c} ")
+        sys.stdout.flush()
+        time.sleep(0.4)
+
 def _run_script_thread(extra_args, job_id):
     try:
         result = subprocess.run(
-            ["python3", "simulate_new.py"] + extra_args,
+            ["python3", "simulate.py"] + extra_args,
             capture_output=True,
             text=True
         )
@@ -101,7 +142,71 @@ def create_file(filename, new_content):
     with os.fdopen(fd, "w") as f:
         f.write(new_content)
 
+    llm_written_files.append(file_path)
     return {"status": f"File {filename} written successfully in the current directory with the absolute path: {file_path}."}
+
+def append_file(file_path, content_to_append):
+    """
+    Append content to a file that was previously created by the LLM.
+    Only allows appending to files that were created by create_file().
+    
+    Args:
+        file_path: Absolute path of file to append to
+        content_to_append: Content to append to the file
+        
+    Returns:
+        dict: Contains status message
+    """
+    
+    # Check if file was previously created by LLM
+    if file_path not in llm_written_files:
+        return {"status": f"Cannot append to {file_path} - file was not created by the agent"}
+        
+    # Check allowed extensions
+    if not file_path.endswith(('.txt', '.md', '.csv')):
+        return {"status": "Only .txt, .md, and .csv files are allowed"}
+        
+    # Check content size
+    if len(content_to_append) > 1_000_000:  # limit to 1MB
+        return {"status": "Content to append is too large"}
+        
+    try:
+        with open(file_path, "a") as f:
+            f.write(content_to_append)
+            
+        return {"status": f"Successfully appended content to {file_path}"}
+        
+    except Exception as e:
+        return {"status": f"Error appending to file: {str(e)}"}
+
+
+def read_simulation_file():
+    """
+    Read the simulate.py file from the current working directory.
+            
+    Returns:
+        dict: Contains status and optionally file_content
+    """
+    filename = "simulate.py"
+    file_path = os.path.join(os.getcwd(), filename)
+        
+    # Check file exists
+    if not os.path.exists(file_path):
+        return {"status": f"File {filename} not found"}
+        
+    # Read file (with size limit)
+    try:
+        # Read the file
+        with open(file_path, 'r') as f:
+            content = f.read()
+            
+        return {
+            "status": "success",
+            "file_content": content
+        }
+        
+    except Exception as e:
+        return {"status": f"Error reading file: {str(e)}"}
 
 
 # ------------------------------
@@ -113,7 +218,7 @@ custom_tools = [
         "name": "run_draft_simulation",
         "description": "This function triggers a draft simulation to run in the background. \
             This function returns a dict with 2 keys: job_id and status. The status key will have a value of 'started' until the simulation is complete. The agent WILL NEED the job_id (string) later to get the results of the draft simulation. This function's parameters are inferred from the user's input. \
-            The purpose of this function is to enable the user to get an idea of the best players available to draft in each round. It basically runs an automated mock draft. \
+            The purpose of this function is to enable the user to get an idea of the best players available to draft in each round. It basically runs an automated mock draft. It is critical that the adp_csv_file contains data for AT LEAST 300 players for the upcoming {season} fantasy football season. \
             \
             The function should be called with the following parameters: \
             num_teams: Number of teams in the user's league (REQUIRED) \
@@ -206,7 +311,7 @@ custom_tools = [
             new_content: The content to be written to the file (required) \
             This function returns a dict with a key for status. \
             If the value of the status key does not contain the word 'successfully', it means that the file was not created successfully. The message should be sent to the user. \
-            If the value of the status key contains the word 'successfully', it means that the file was created successfully. The message should be sent to the user; the message should include the absolute path of the file that was created.",
+            If the value of the status key contains the word 'successfully', it means that the file was created successfully. The value of the status key should be sent to the user; the value includes the absolute path of the file that was created. Note, the absolute file path may be needed to append to the same file later.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -214,6 +319,36 @@ custom_tools = [
                 "new_content": {"type": "string"}
             },
             "required": ["filename", "new_content"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "read_simulation_file",
+        "description": "This function reads the simulate.py file from the current working directory. The purpose of this function is to give context to the user about the intricacies of the simulation design. No parameters are needed for this function.\
+            The function returns a dict with a key for status and a key for file_content. The status key will have a value of 'success' if the file was read successfully. The file_content key will have the contents of the the file that was read. \
+            If the value of the status key is not 'success', it means that the file was not read successfully. Typically, when the read fails, it's because the user is not executing agent.py from the root directory of the project. The value of the status key should be sent to the user.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "type": "function",
+        "name": "append_file",
+        "description": "This function appends content to a file that was previously created by the agent. The function should be called with the following parameters: \
+            file_path: The absolute path of the file to append to (required) \
+            content_to_append: The content to append to the file (required) \
+            This function returns a dict with a key for status. \
+            If the value of the status key does not contain the word 'successfully', it means that the file was not appended to successfully. The message should be sent to the user. \
+            If the value of the status key contains the word 'successfully', it means that the file was appended to successfully. The value of the status key should be sent to the user; the value includes the absolute path of the file that was appended to.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "content_to_append": {"type": "string"}
+            },
+            "required": ["file_path", "content_to_append"]
         }
     }
 ]
@@ -244,11 +379,15 @@ def agent_chat():
     ║   ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║                 ║
     ║   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝                 ║
     ║                                                               ║
-    ║   Your AI Fantasy Football Draft Assistant                    ║
-    ║   - Simulates draft scenarios                                ║
-    ║   - Provides player insights and analysis                    ║
-    ║   - Helps optimize your draft strategy                       ║
-    ║   - Stays current with latest fantasy news                   ║
+    ║   Your AI Fantasy Football Draft Assistant. I'm capable of:   ║
+    ║   - Simulating/mocking drafts                                ║
+    ║   - Providing insights into the simulation design and        ║
+    ║     intricacies                                              ║
+    ║   - Providing player insights and analysis                   ║
+    ║   - Helping optimize your draft strategy                     ║
+    ║   - Staying current with latest fantasy news                 ║
+    ║   - Creating files to save data, results, and insights       ║
+    ║   - Enter 'exit' or 'quit' to end the conversation.          ║
     ║                                                              ║
     ╚═══════════════════════════════════════════════════════════════╝
     """)
@@ -263,13 +402,20 @@ def agent_chat():
         # Call the Responses API
         done = False
         while not done:
-            
-            response = client.responses.create(
-                model="gpt-5-mini",
-                input=conversation,
-                tools=tools
-            )
+          
+            stop_event = threading.Event()
+            t = threading.Thread(target=spinner, args=(stop_event,))
+            t.start()
 
+            try:
+                response = client.responses.create(
+                            model="gpt-5-mini",
+                            input=conversation,
+                            tools=tools
+                        )
+            finally:
+                stop_event.set()
+                t.join()            
             new_tool_call = False
 
             for o in response.output:
@@ -296,6 +442,10 @@ def agent_chat():
                         tool_result = get_simulation_status_and_results(**tool_args)
                     elif tool_name == "create_file":
                         tool_result = create_file(**tool_args)
+                    elif tool_name == "read_simulation_file":
+                        tool_result = read_simulation_file()
+                    elif tool_name == "append_file":
+                        tool_result = append_file(**tool_args)
 
                     conversation.append({
                         "type": "function_call_output",
