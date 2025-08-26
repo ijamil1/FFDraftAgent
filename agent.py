@@ -7,11 +7,14 @@ from openai import OpenAI
 import itertools, sys, threading, time
 from dotenv import load_dotenv
 from datetime import date
+import argparse
+
 load_dotenv()
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-season = date.today().year
+today = date.today()
+season = today.year
 llm_written_files = [] # list of files that the llm has written to the local directory
 
 # System prompt (configurable via env var AGENT_SYSTEM_PROMPT)
@@ -19,7 +22,7 @@ SYSTEM_PROMPT =  f"You are a fantasy football expert who grounds opinions based 
 Your goal is to help the user in the upcoming {season} fantasy football season. \
 You can run draft simulations given some inputs from the user. \
 You can answer questions about the simulation design and intricacies. \
-You can help the user prepare for the draft and by answering their questions about the draft and the upcoming NFL season in general by getting the latest news, information, and outlook from the web. \
+You can help the user prepare for the draft and by answering their questions about the draft and the upcoming NFL season in general by getting the most up-to-date and current news and information from the web as of {today.strftime('%B %d, %Y')}. \
 You can save and write files to the local directory. \
 Whenever you do use the web, use the best sources for {season} fantasy football data like ESPN, CBS, Yahoo, and NFL.com, and PFF. \
 Whenever the user asks about a specific player’s outlook, injury status, pros/cons, or fantasy projections, you must call the web_search tool before answering. \
@@ -31,8 +34,8 @@ In additon to having web search enabled, you have access to the following tools:
             There is some nuance to calling this function in regards to the adp_csv_file. The adp_csv_file parameter is the absolute filepath of the file that contains the average draft position data for players. It is essential for the simulation. BUT, I want to let the user either provide the absolute path OR let you, the agent, create the file after web searching for the data. \
             If the user provides the filepath, use it directly as the adp_csv_file parameter. \
             If not, let the user know that you will do a web search yourself to scrape the data. Be mindful of the required schema of the adp_csv_file. The csv schema must be: 'Player (str), ADP (float), Position (str)'. 'Position' is one of: QB, RB, WR, TE, K, DST. \
-            So, the web search needs to scrape the player name, average draft position, and position. It is CRITICAL that the web search retrieves data for AT LEAST 300 players for the upcoming {season} fantasy football season. Each position has a minimum number of players that have to be retrieved: QB: 14, RB: 70, WR: 70, TE: 14, K: 14, DST: 14. Ideally, more than the minimum number of players for each position are retrieved. The simulation may fail otherwise. \
-            Get ADP data from ONE reputable source like ESPN, CBS, Yahoo, and NFL.com, or PFF. You should use the create_file tool to create a new csv file with the adp data. Note, you need to format the data as a csv file but it doesn't need to natively be exported from the web as a csv file.\
+            So, the web search needs to scrape the player name, average draft position (for PPR scoring), and position. It is CRITICAL that the web search retrieves data for AT LEAST 300 players for the upcoming {season} fantasy football season. Each position has a minimum number of players that have to be retrieved: QB: 14, RB: 70, WR: 70, TE: 14, K: 14, DST: 14. Ideally, more than the minimum number of players for each position are retrieved. The simulation may fail otherwise. \
+            Get ADP data from one or a combination of reputable sources like ESPN, CBS, Yahoo, and NFL.com, or PFF. If finding ADP is too tricky, you can use PPR rank as a proxy for ADP. You should use the create_file tool to create a new csv file with the adp data. Note, you need to format the data as a csv file but it doesn't need to natively be exported from the web as a csv file.\
              \
             Choose a relevant filename for the adp_csv_file, write the content, and use the absolute filepath of the file containing the data you just wrote as the adp_csv_file parameter. This path can be found in the status key of the dict returned from the create_file tool. \
             \
@@ -359,7 +362,7 @@ tools = custom_tools + [{"type": "web_search"}]
 # ------------------------------
 # Agent Loop
 # ------------------------------
-def agent_chat():
+def agent_chat(model):
     conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     print("""
@@ -381,8 +384,8 @@ def agent_chat():
     ║                                                               ║
     ║   Your AI Fantasy Football Draft Assistant. I'm capable of:   ║
     ║   - Simulating/mocking drafts                                ║
-    ║   - Providing insights into the simulation design and        ║
-    ║     intricacies                                              ║
+    ║   - Retrieving ADP data for the upcoming {season} fantasy    ║
+    ║     football season                                         ║
     ║   - Providing player insights and analysis                   ║
     ║   - Helping optimize your draft strategy                     ║
     ║   - Staying current with latest fantasy news                 ║
@@ -409,7 +412,7 @@ def agent_chat():
 
             try:
                 response = client.responses.create(
-                            model="gpt-5-mini",
+                            model=model,
                             input=conversation,
                             tools=tools
                         )
@@ -458,4 +461,19 @@ def agent_chat():
                 done = True
 
 if __name__ == "__main__":
-    agent_chat()
+    parser = argparse.ArgumentParser(
+        description="Fantasy Football Draft Assistant - Agent Module",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Required arguments
+    parser.add_argument(
+        '--model',
+        type=str,
+        default="gpt-5-mini",
+        choices=["gpt-5-mini", "gpt-5", "gpt-4.1-mini"],
+        help='Model to use for the agent (optional; default is gpt-5-mini)'
+    )
+    args = parser.parse_args()
+
+    agent_chat(model=args.model)
