@@ -10,9 +10,10 @@ import numpy as np
 from enum import IntEnum
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import Manager
-import time
 from functools import partial
 from collections import Counter
+import re
+import random
 
 class Position(IntEnum):
     QB = 0
@@ -22,22 +23,33 @@ class Position(IntEnum):
     K = 4
     DST = 5
 
-TEAM_COMPOSITION = [1, 5, 5, 1, 1, 1]
+TEAM_COMPOSITION_14 = [[1, 5, 5, 1, 1, 1], [2, 4, 4, 2, 1, 1], [2, 5, 4, 1, 1, 1], [2, 4, 5, 1, 1, 1], [1, 4, 4, 2, 1, 2]]
+TEAM_COMPOSITION_15 = [[2, 4, 5, 2, 1, 1], [2, 5, 4, 2, 1, 1], [2, 4, 4, 2, 1, 2]]
+TEAM_COMPOSITION_16 = [[2, 5, 5, 2, 1, 1], [2, 5, 4, 2, 1, 2], [2, 4, 5, 2, 1, 2], [2, 6, 5, 1, 1, 1], [2, 5, 6, 1, 1, 1], [1, 5, 6, 2, 1, 1], [1, 6, 5, 2, 1, 1]]
 
+assert all([sum(i) == 14 for i in TEAM_COMPOSITION_14])
+assert all([sum(i) == 15 for i in TEAM_COMPOSITION_15])
+assert all([sum(i) == 16 for i in TEAM_COMPOSITION_16])
 
 def run_sim(sim_id, num_teams, draft_rounds, pick, keepers_df, player_df):
     # Each process can update the shared dict
+    team_roster_breakdown = {} #maps team number to what the final composition of the their team must be at the end of the draft
     team_composition = {} #maps team number to a list contaiing the number of players drafted at each position (QB, RB, WR, TE, K, DST)    
     team_rounds_picked = {} #maps team number to a list containing the rounds picked for each team
     team_roster = {} #maps team number to a list containing the players drafted for each team
     keeper_players = keepers_df['Player'].tolist()
-    filtered_player_df = player_df[~player_df['Player'].isin(keeper_players)].reset_index(drop=True)
+    
+    normalized_keeper_names = [normalize(n) for n in keeper_players]
+    filtered_player_df = player_df.copy()
+    filtered_player_df['Player_normalized'] = filtered_player_df.apply(apply_normalize, axis = 1)
+    filtered_player_df = filtered_player_df[~filtered_player_df['Player_normalized'].isin(normalized_keeper_names)].reset_index(drop=True).drop(columns=['Player_normalized'])
+
     selected_players_bool_arr = np.zeros(filtered_player_df.shape[0], dtype=bool)
     results_dict = {}
     for draft_round in range(1, draft_rounds+1):
         results_dict[draft_round] = []
 
-    reset_tracking_dicts(team_composition, team_rounds_picked, team_roster, num_teams, keepers_df)
+    reset_tracking_dicts(team_roster_breakdown, team_composition, team_rounds_picked, team_roster, num_teams, keepers_df)
         
         
     for draft_round in range(1, draft_rounds+1):
@@ -56,16 +68,24 @@ def run_sim(sim_id, num_teams, draft_rounds, pick, keepers_df, player_df):
             if team == pick:
                 #your pick
                 if len(player_df) >= 10:
-                    pos_slots_avail = np.array(TEAM_COMPOSITION) - np.array(team_composition[team])
+     
+                    pos_slots_avail = np.array(team_roster_breakdown[team]) - np.array(team_composition[team])
                     indices = np.where(pos_slots_avail == 0)[0]
                     unavailable_positions = [Position(i).name for i in indices]
-                    if team_composition[team][Position.RB.value] <= 1 and team_composition[team][Position.WR.value] >= 3:
+                    rb_wr_diff = team_composition[team][Position.RB.value] - team_composition[team][Position.WR.value]
+                    if rb_wr_diff <= -2: #2 WRs more than RBs
                         unavailable_positions.append('WR')
-                    if team_composition[team][Position.RB.value] >= 3 and team_composition[team][Position.WR.value] <= 1:
+                    if rb_wr_diff >= 2: #2 RBs more than WRs
                         unavailable_positions.append('RB')
                     
-                    if team_composition[team][Position.RB.value] < 3 or team_composition[team][Position.WR.value] < 3:
+                    if (team_composition[team][Position.QB.value] < 1) or (team_composition[team][Position.TE.value] < 1):
                         unavailable_positions += ['DST', 'K']
+                    
+                    if (team_composition[team][Position.QB.value] == 1) and ((team_composition[team][Position.RB.value] < 3) or (team_composition[team][Position.WR.value] < 3)):
+                        unavailable_positions += ['QB']
+    
+                    if (team_composition[team][Position.TE.value] == 1) and ((team_composition[team][Position.RB.value] < 3) or (team_composition[team][Position.WR.value] < 3)):
+                        unavailable_positions += ['TE']
                     
                     available_positions_bool_arr = ~filtered_player_df['Position'].isin(unavailable_positions).to_numpy()
                     available_bool_arr = available_positions_bool_arr & ~selected_players_bool_arr #valid positions and not already selected
@@ -75,22 +95,39 @@ def run_sim(sim_id, num_teams, draft_rounds, pick, keepers_df, player_df):
                         player_name = filtered_player_df.iloc[row_index]['Player']
                         pos = filtered_player_df.iloc[row_index]['Position']
                         adp = filtered_player_df.iloc[row_index]['ADP']
-                        results_dict[draft_round].append(player_name + '_' + pos + '_' + str(adp))
+                        nfl_team = None
+                        if 'Team' in filtered_player_df.columns:
+                            nfl_team = filtered_player_df.iloc[row_index]['Team']
+                        if nfl_team is None or nfl_team == 'missing':
+                            nfl_team = 'N/A'
+                        results_dict[draft_round].append(player_name + '_' + nfl_team + '_' + pos + '_' + str(adp))
 
                 
-                generate_pick(team, draft_round, team_composition, team_rounds_picked, team_roster, filtered_player_df, selected_players_bool_arr)
+                generate_pick(team, draft_round, team_roster_breakdown, team_composition, team_rounds_picked, team_roster, filtered_player_df, selected_players_bool_arr)
                 continue
             else:
                 #someone else's pick
-                generate_pick(team, draft_round, team_composition, team_rounds_picked, team_roster, filtered_player_df, selected_players_bool_arr)
+                generate_pick(team, draft_round, team_roster_breakdown, team_composition, team_rounds_picked, team_roster, filtered_player_df, selected_players_bool_arr)
                 continue
 
     return results_dict
 
+def normalize(s):
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+    
+def apply_normalize(x):
+    s = x['Player']
+    return re.sub(r"[^a-z0-9]", "", s.lower())
 
-def reset_tracking_dicts(team_composition, team_rounds_picked, team_roster, num_teams, keepers):
+def reset_tracking_dicts(team_roster_breakdown, team_composition, team_rounds_picked, team_roster, num_teams, keepers):
     for i in range(num_teams):
         team_composition[i+1] = [0]*len(Position.__members__)
+        if num_teams == 14:
+            team_roster_breakdown[i+1] = random.choice(TEAM_COMPOSITION_14)
+        elif num_teams == 15:
+            team_roster_breakdown[i+1] = random.choice(TEAM_COMPOSITION_15)
+        elif num_teams == 16:
+            team_roster_breakdown[i+1] = random.choice(TEAM_COMPOSITION_16)
     
     for i in range(num_teams):
         team_rounds_picked[i+1] = []
@@ -116,14 +153,14 @@ def sample_discrete_pareto(size=1, x_max=15):
     Returns:
         samples (np.ndarray): Samples from the distribution
     """
-    alpha = np.random.uniform(1.5, 2.5)
+    alpha = np.random.uniform(1.4, 2.3)
     x = np.arange(1, x_max+1, dtype=np.float64)  # 1, 2, ..., x_max
     pmf = (1 / x**alpha) - (1 / (x + 1)**alpha)
     pmf /= pmf.sum()  # Normalize to ensure sum = 1
 
     return np.random.choice(np.arange(1, x_max+1), size=size, p=pmf)
 
-def generate_pick(team, draft_round, team_composition, team_rounds_picked, team_roster, player_df, selected_players_bool_arr):
+def generate_pick(team, draft_round, team_roster_breakdown, team_composition, team_rounds_picked, team_roster, player_df, selected_players_bool_arr):
     """
     Generate a pick for a team in a given round.
     team: the team number
@@ -139,7 +176,7 @@ def generate_pick(team, draft_round, team_composition, team_rounds_picked, team_
     #update team_composition and team_rounds_picked
     #return the player_df after removing the player
 
-    pos_slots_avail = np.array(TEAM_COMPOSITION) - np.array(team_composition[team])
+    pos_slots_avail = np.array(team_roster_breakdown[team]) - np.array(team_composition[team])
     indices = np.where(pos_slots_avail == 0)[0]
     unavailable_positions = [Position(i).name for i in indices]
     rb_wr_diff = team_composition[team][Position.RB.value] - team_composition[team][Position.WR.value]
@@ -151,11 +188,17 @@ def generate_pick(team, draft_round, team_composition, team_rounds_picked, team_
     if (team_composition[team][Position.QB.value] < 1) or (team_composition[team][Position.TE.value] < 1):
         unavailable_positions += ['DST', 'K']
     
+    if (team_composition[team][Position.QB.value] == 1) and ((team_composition[team][Position.RB.value] < 3) or (team_composition[team][Position.WR.value] < 3)):
+        unavailable_positions += ['QB']
+    
+    if (team_composition[team][Position.TE.value] == 1) and ((team_composition[team][Position.RB.value] < 3) or (team_composition[team][Position.WR.value] < 3)):
+        unavailable_positions += ['TE']
+    
     available_positions_bool_arr = ~player_df['Position'].isin(unavailable_positions).to_numpy()
     available_bool_arr = available_positions_bool_arr & ~selected_players_bool_arr #valid positions and not already selected
     available_indices = np.flatnonzero(available_bool_arr)
 
-    pick = sample_discrete_pareto(size=1, x_max=min(15, available_indices.shape[0]))
+    pick = sample_discrete_pareto(size=1, x_max=min(25, available_indices.shape[0]))
     row_index = available_indices[pick - 1]
     player_row = player_df.iloc[row_index]
     pos = player_row['Position'].item()
@@ -200,7 +243,7 @@ def main():
         '--draft_rounds',
         type=int,
         required=True,
-        help='Number of draft rounds (required); must be between 1 and 14 (inclusive)'
+        help='Number of draft rounds (required); must be between 14 and 16 (inclusive)'
     )
     
     # Optional arguments
@@ -235,8 +278,8 @@ def main():
         print(f"Error: pick must be between 1 and {args.num_teams}", file=sys.stderr)
         sys.exit(1)
 
-    if args.draft_rounds <= 0 or args.draft_rounds > 14:
-        print("Error: draft_rounds must be a positive integer between 1 and 14 (inclusive)", file=sys.stderr)
+    if args.draft_rounds < 14 or args.draft_rounds > 16:
+        print("Error: draft_rounds must be a positive integer between 14 and 16 (inclusive)", file=sys.stderr)
         sys.exit(1)
 
 
@@ -273,12 +316,14 @@ def main():
     # Load ADP CSV data
     try:
         player_df = pd.read_csv(args.adp_csv_file, header=0, index_col=False)
+        player_df = player_df.sort_values(by=['ADP'], ascending=True, ignore_index=True)
     except Exception as e:
         print(f"Error reading in CSV data of the players: {e}", file=sys.stderr)
         sys.exit(1)
     
-    if not (player_df.columns == ['Player', 'ADP', 'Position']).all():
-        print("Error: adp_data must have the columns: 'Player', 'ADP', 'Position'", file=sys.stderr)
+    required_columns = ['Player', 'Position', 'ADP']
+    if not all(col in player_df.columns for col in required_columns):
+        print("Error: adp_data must have the columns: 'Player', 'Position', 'ADP'", file=sys.stderr)
         sys.exit(1)
     
     if not player_df['Position'].isin(Position.__members__).all():
@@ -319,14 +364,14 @@ def main():
 
     
 
-    for draft_round in range(1, 15):
+    for draft_round in range(1, args.draft_rounds+1):
         sorted_dict = dict(sorted(shared_dict[draft_round].items(), key=lambda item: item[1], reverse=True))
         print(f"Most Likely Top 10 Players Available in Round {draft_round}:")
         if len(sorted_dict):
             for player_pos_adp, count in list(sorted_dict.items())[:10]:
-                player, pos, adp = player_pos_adp.split('_')
+                player, team, pos, adp = player_pos_adp.split('_')
                 adp = float(adp)
-                print(f"{player}, {pos}, {round(count/num_sims*100, 2)}%, ADP: {adp:.2f}")
+                print(f"{player}, {team}, {pos}, {round(count/num_sims*100, 2)}%, ADP: {adp:.2f}")
         else:
             print("Keeper used in this round")
         print('--------------------------------')

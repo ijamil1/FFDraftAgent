@@ -8,6 +8,9 @@ import itertools, sys, threading, time
 from dotenv import load_dotenv
 from datetime import date
 import argparse
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
 
 load_dotenv()
 
@@ -17,7 +20,40 @@ today = date.today()
 season = today.year
 llm_written_files = [] # list of files that the llm has written to the local directory
 max_retries = 5
-backoff = 1  # seconds
+backoff = 5  # seconds
+teams = [
+    "NYJ",
+    "PHI",
+    "LAC",
+    "DEN",
+    "LV",
+    "NO",
+    "TEN",
+    "MIA",
+    "CIN",
+    "HOU",
+    "SEA",
+    "TB",
+    "CLE",
+    "ATL",
+    "MIN",
+    "IND",
+    "CHI",
+    "BUF",
+    "JAC",
+    "KC",
+    "CAR",
+    "LAR",
+    "SF",
+    "BAL",
+    "DET",
+    "ARI",
+    "GB",
+    "NYG",
+    "DAL",
+    "WAS",
+    "PIT",
+    "NE"]
 
 # System prompt (configurable via env var AGENT_SYSTEM_PROMPT)
 SYSTEM_PROMPT =  f"You are a fantasy football expert who grounds opinions based on facts and the latest news and projections, and you have taken on the role of a helpful, concise assistant. \
@@ -33,13 +69,10 @@ In additon to having web search enabled, you have access to the following tools:
     - run_draft_simulation: This function triggers a draft simulation to run in the background.  This function should be called when the user requests you to simulate a draft. Note, the user request might not directly \
             use the words 'simulate' or 'draft' in their request. You, the agent, should be able to infer this when the user asks for predictions on who will be available in each round or something similar. \
             This function should NOT be called more than 1x unless the user explictly asks for a new simulation or adjusts the parameters of the simulation. If the user asks for more information on the results and/or players, the agent should use web search to get the information. If you are unsure about whether the user is asking for a new simulation or not, ask the user to confirm their request.\
-            There is some nuance to calling this function in regards to the adp_csv_file. The adp_csv_file parameter is the absolute filepath of the file that contains the average draft position data for players. It is essential for the simulation. BUT, I want to let the user either provide the absolute path OR let you, the agent, create the file after web searching for the data. \
+            There is some nuance to calling this function in regards to the adp_csv_file. The adp_csv_file parameter is the absolute filepath of the file that contains the average draft position data for players. It is essential for the simulation. BUT, I want to let the user either provide the absolute path OR let you, the agent, retrieve the required data on the user's behalf. \
             If the user provides the filepath, use it directly as the adp_csv_file parameter. \
-            If not, let the user know that you will do a web search yourself to scrape the data. Be mindful of the required schema of the adp_csv_file. The csv schema must be: 'Player (str), ADP (float), Position (str)'. 'Position' is one of: QB, RB, WR, TE, K, DST. \
-            So, the web search needs to scrape the player name, average draft position (for PPR scoring), and position. It is CRITICAL that the web search retrieves data for AT LEAST 300 players for the upcoming {season} fantasy football season. Each position has a minimum number of players that have to be retrieved: QB: 14, RB: 70, WR: 70, TE: 14, K: 14, DST: 14. Ideally, more than the minimum number of players for each position are retrieved. The simulation may fail otherwise. \
-            Get ADP data from one or a combination of reputable sources like ESPN, CBS, Yahoo, and NFL.com, or PFF. If finding ADP is too tricky, you can use PPR rank as a proxy for ADP. You should use the create_file tool to create a new csv file with the adp data. Note, you need to format the data as a csv file but it doesn't need to natively be exported from the web as a csv file.\
-            Choose a relevant filename for the adp_csv_file, write the content, and use the absolute filepath of the file containing the data you just wrote as the adp_csv_file parameter. This path can be found in the status key of the dict returned from the create_file tool. \
-            \
+            If not, you will need to call the get_adp_data tool to retrieve the data. Let the user know that you will do this. Inform them that the data is being retrieved from FantasyPros but that retrieval can fail because scraping assumes static webpages.\
+            The get_adp_data tool returns a dict with 2 keys: 'status' and 'file_path'. If the status key has a value of 'Success', then 'file_path' holds the absolute filepath of the ADP csv file and can be passed as the adp_csv_file parameter to the simulation. If the status key has a value of 'Failed', then the file_path key will be None and the simulation won't be able to run. Inform the user in that case. \
     - get_simulation_status_and_results: This function should be used to retrieve the status and/or results of the draft simulation. This function is \
     used to check the status of the simulation that is running in the background. Call this function when the user is asking for the status or results of the draft simulation. This function \
     should only be called if run_draft_simulation has been called earlier. \
@@ -72,7 +105,8 @@ Instead, your role is to help the user manage large tasks effectively:\
    - Always either (a) finish the requested task, or (b) persist intermediate progress before ending your turn. \
    - If the user has given you a task that is too large for one step, clearly tell them so and suggest a breakdown strategy. \
    - If you must return control before the task is finished, explicitly inform the user that the task is incomplete and how they can continue.\
-NEVER claim to run tasks (other than the simulation) in the background. NEVER silently drop progress."
+NEVER claim to run tasks (other than the simulation) in the background. NEVER silently drop progress.\
+Note, you do not have the ability to alter/modify the simulation code itself, so don't tell the user that you are able to alter the logic. You can only alter the parameters of the simulation."
 # ------------------------------
 # Job Management
 # ------------------------------
@@ -88,6 +122,102 @@ def spinner(stop_event, msg="Thinking..."):
         sys.stdout.write(f"\r{msg}{c} ")
         sys.stdout.flush()
         time.sleep(0.4)
+
+def remove_bye(x):
+  s = x['Player Team (Bye)']
+  left_par = s.find('(')
+  if left_par != -1:
+    return s[:left_par-1].strip()
+  else:
+    return s.strip()
+
+def get_team(x):
+  s = x['Player Team']
+  l = s.split(' ')
+  if l[-1] in teams:
+    return l[-1]
+  else:
+    return 'missing'
+
+def get_player(x):
+  s = x['Player Team']
+  l = s.split(' ')
+  if l[-1] in teams or l[-1] == 'DST':
+    return ' '.join(l[:-1])
+  else:
+    return ' '.join(l)
+
+
+def get_pos(row):
+  pos_str = row['POS']
+  pos = ''
+  for c in pos_str:
+    if c.isdigit():
+      continue
+    else:
+      pos += c
+  return pos
+
+
+def get_adp_data():
+  url = "https://www.fantasypros.com/nfl/adp/ppr-overall.php"
+  headers = {"User-Agent": "Mozilla/5.0"}  # helps avoid bot blocks
+  response = requests.get(url, headers=headers)
+  file_name = "adp_data.csv"
+
+  html = response.text
+
+  soup = BeautifulSoup(html, "html.parser")
+
+  table = soup.find("table", id="data")
+
+  thead = table.find("thead")
+  tbody = table.find("tbody")
+
+  headers = []
+  rows = []
+  for tr in thead.find_all("tr"):
+      for th in tr.find_all("th"):
+          headers.append(th.text)
+
+  for tr in tbody.find_all("tr"):
+      row = []
+      for td in tr.find_all("td"):
+          row.append(td.text)
+      rows.append(row)
+
+  data = [headers] + rows
+
+  df = pd.DataFrame(data[1:], columns=data[0])  # first row as headers
+
+  df['ADP'] = df['AVG'].astype(float)
+  df = df[['Player Team (Bye)', 'POS', 'ADP']]
+
+
+  df['Player Team'] = df.apply(remove_bye, axis=1)
+  df = df.drop(columns=['Player Team (Bye)'])
+  df['Team'] = df.apply(get_team, axis=1)
+  df['Player'] = df.apply(get_player, axis=1)
+  df = df.drop(columns=['Player Team'])
+  df['Position'] = df.apply(get_pos, axis=1)
+  df = df[~df['Position'].isin(['CB', 'LB', 'DT'])].reset_index(drop=True)
+  df = df.sort_values(by=['ADP'], ascending=True, ignore_index=True)
+  df = df[['Player', 'Team', 'Position', 'ADP']]
+
+  if df['Player'].isna().sum().item() or df['Position'].isna().sum().item():
+    return {'status': 'Failed', 'filepath': None}
+  
+  if ((df['ADP'][1:]).reset_index(drop=True) < (df['ADP'][:-1]).reset_index(drop=True)).sum().item():
+    return {'status': 'Failed', 'filepath': None}
+
+  # Check if file already exists
+  file_path = os.path.join(os.getcwd(), file_name)
+  if os.path.exists(file_path):
+    return {'status': 'Failed because adp_data.csv already exists in the current directory', 'filepath': None}
+    
+  # Write dataframe to CSV file in current directory
+  df.to_csv(file_path, index=False)
+  return {'status': 'Success', 'filepath': file_path}
 
 def _run_script_thread(extra_args, job_id):
     try:
@@ -227,8 +357,8 @@ custom_tools = [
             The function should be called with the following parameters: \
             num_teams: Number of teams in the user's league (REQUIRED) \
             pick: The user's draft pick position (REQUIRED) \
-            draft_rounds: Number of rounds in the draft (REQUIRED) \
-            adp_csv_file: *Absolute* file path for player data in CSV format (REQUIRED); the csv schema must be: 'Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order. \
+            draft_rounds: Number of rounds in the draft (REQUIRED); must be between 14 and 16 (inclusive) \
+            adp_csv_file: *Absolute* file path for player data in CSV format (REQUIRED); the csv schema must contain: 'Player (str), ADP (float), Position (str)' in some order where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order. Should have at least 300 players. \
             keepers_csv_file: *Absolute* file path for keepers data in CSV format (OPTIONAL). If provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive). \
             num_sims: Number of draft simulations to run (OPTIONAL) \
             \
@@ -240,7 +370,7 @@ custom_tools = [
                 "num_teams": {"type": "integer", "description": "Number of teams in the user's league (ie: 14)"},
                 "pick": {"type": "integer", "description": "The user's draft pick position (ie: 1)"},
                 "draft_rounds": {"type": "integer", "description": "Number of rounds in the draft (ie: 14)"},
-                "adp_csv_file": {"type": "string", "description": "Absolute file path for player data in CSV format; the csv schema must be: 'Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order."},
+                "adp_csv_file": {"type": "string", "description": "Absolute file path for player data in CSV format; the csv schema must contain: 'Player (str), ADP (float), Position (str)' in some order where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order. Should have at least 300 players."},
                 "keepers_csv_file": {"type": "string", "description": "Absolute file path for keepers data in CSV format; if provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive)."},
                 "num_sims": {"type": "integer", "description": "Number of draft simulations to run (ie: 2000)"},
             },
@@ -259,25 +389,27 @@ custom_tools = [
             The result key will have a value of the results of the draft simulation stored as a dict, d. If the only key in dict, d, is error, it means that there was an exception when trying to run the simulation script.\
             Otherwise, the dict, d, will have a key for stdout which contains the simulation results which should be sent to the user. The simulation results will look like the following: \
                 Most Likely Top 10 Players Available in Round 1: \
-                Player 1_1, Percentage of simulations available, ADP \
-                Player 2_1, Percentage of simulations available, ADP \
+                Player 1_1, Team, Position, Percentage of simulations available, ADP \
+                Player 2_1, Team, Position, Percentage of simulations available, ADP \
                 ...\
-                Player 10_1, Percentage of simulations available, ADP \
+                Player 10_1, Team, Position, Percentage of simulations available, ADP \
                 Most Likely Top 10 Players Available in Round 2: \
-                Player 1_2, Percentage of simulations available, ADP \
-                Player 2_2, Percentage of simulations available, ADP \
+                Player 1_2, Team, Position, Percentage of simulations available, ADP \
+                Player 2_2, Team, Position, Percentage of simulations available, ADP \
                 ...\
-                Player 10_2, Percentage of simulations available, ADP \
+                Player 10_2, Team, Position, Percentage of simulations available, ADP \
                 Most Likely Top 10 Players Available in Round X: \
                 Keeper used in this round\
                 ... \
                 Most Likely Top 10 Players Available in Round 14: \
-                Player 1_14, Percentage of simulations available, ADP \
-                Player 2_14, Percentage of simulations available, ADP \
+                Player 1_14, Team, Position, Percentage of simulations available, ADP \
+                Player 2_14, Team, Position, Percentage of simulations available, ADP \
                 ...\
-                Player 10_14, Percentage of simulations available, ADP \
+                Player 10_14, Team, Position, Percentage of simulations available, ADP \
                 \
                 ADP: The ADP of the player is the average draft position of the player.\
+                Team: The NFL team that the player is on. \
+                Position: The position of the player. \
                 Percentage of simulations available: The percentage of simulations that the player is available in the given round. \
                 The agent should send the simulation results to the user in a friendly and easy to understand format. \
                 The agent should not make up any information or make assumptions about the user's league or the draft.",
@@ -336,6 +468,17 @@ custom_tools = [
             },
             "required": ["file_path", "content_to_append"]
         }
+    },
+    {
+        "type": "function",
+        "name": "get_adp_data",
+        "description": "This function retrieves the ADP data for the upcoming {season} fantasy football season. The function should not be called with parameters. \
+            This function returns a dict with a key named 'status' and a key named 'file_path'. The status key will have a value of 'Success' if the ADP data was retrieved successfully. If successful, then 'file_path' will hold the absolute file path of a csv file with the ADP data. The ADP data has the following schema: 'Player', 'Team', 'Position', 'ADP'. The ADP data will be sorted by 'ADP' in ascending order.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
     }
 ]
 
@@ -351,30 +494,30 @@ def agent_chat(model):
     print("""
     ╔═══════════════════════════════════════════════════════════════╗
     ║                                                               ║
-    ║   ██████╗ ██████╗  █████╗ ███████╗████████╗                  ║
-    ║   ██╔══██╗██╔══██╗██╔══██╗██╔════╝╚══██╔══╝                  ║
-    ║   ██║  ██║██████╔╝███████║█████╗     ██║                     ║
-    ║   ██║  ██║██╔══██╗██╔══██║██╔══╝     ██║                     ║
-    ║   ██████╔╝██║  ██║██║  ██║██║        ██║                     ║
-    ║   ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝        ╚═╝                     ║
+    ║   ██████╗ ██████╗  █████╗ ███████╗████████╗                   ║
+    ║   ██╔══██╗██╔══██╗██╔══██╗██╔════╝╚══██╔══╝                   ║
+    ║   ██║  ██║██████╔╝███████║█████╗     ██║                      ║
+    ║   ██║  ██║██╔══██╗██╔══██║██╔══╝     ██║                      ║
+    ║   ██████╔╝██║  ██║██║  ██║██║        ██║                      ║
+    ║   ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝        ╚═╝                      ║
     ║                                                               ║
-    ║    █████╗  ██████╗ ███████╗███╗   ██╗████████╗              ║
-    ║   ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝              ║
-    ║   ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║                 ║
-    ║   ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║                 ║
-    ║   ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║                 ║
-    ║   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝                 ║
+    ║    █████╗  ██████╗ ███████╗███╗   ██╗████████╗                ║
+    ║   ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝                ║
+    ║   ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║                   ║
+    ║   ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║                   ║
+    ║   ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║                   ║
+    ║   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝                   ║
     ║                                                               ║
     ║   Your AI Fantasy Football Draft Assistant. I'm capable of:   ║
-    ║   - Simulating/mocking drafts                                ║
-    ║   - Retrieving ADP data for the upcoming {season} fantasy    ║
-    ║     football season                                         ║
-    ║   - Providing player insights and analysis                   ║
-    ║   - Helping optimize your draft strategy                     ║
-    ║   - Staying current with latest fantasy news                 ║
-    ║   - Creating files to save data, results, and insights       ║
-    ║   - Enter 'exit' or 'quit' to end the conversation.          ║
-    ║                                                              ║
+    ║   - Simulating/mocking drafts                                 ║
+    ║   - Retrieving Average Draft Position (ADP) data for the      ║
+    ║     upcoming fantasy football season                          ║
+    ║   - Providing player insights and analysis                    ║
+    ║   - Helping optimize your draft strategy                      ║
+    ║   - Staying current with latest fantasy news                  ║
+    ║   - Creating files to save data, results, and insights        ║
+    ║   - Enter 'exit' or 'quit' to end the conversation.           ║
+    ║                                                               ║
     ╚═══════════════════════════════════════════════════════════════╝
     """)
     
@@ -404,11 +547,15 @@ def agent_chat(model):
                         )
                         break  # success → exit loop
                     except RateLimitError as e:
-                        wait = backoff * (2 ** attempt)  # exponential backoff
+                        wait = backoff * (2 ** (attempt+1))  # exponential backoff
                         print(f"OpenAI rate limit hit on your key (attempt {attempt+1}). Retrying in {wait:.1f}s...")
                         time.sleep(wait)
+                        conversation.append({
+                            "role": "system",
+                            "content": "The API was rate limited. You may have to break the current task into smaller steps so fewer tokens are required per request."
+                        })
                 else:
-                    raise RuntimeError("Max retries exceeded due to OpenAI rate limiting you. Please try again later.")
+                    raise RuntimeError("Max retries exceeded due to OpenAI rate limiting you. Please try again later. Session ending...")
             finally:
                 stop_event.set()
                 t.join()
@@ -443,6 +590,8 @@ def agent_chat(model):
                         tool_result = read_simulation_file()
                     elif tool_name == "append_file":
                         tool_result = append_file(**tool_args)
+                    elif tool_name == "get_adp_data":
+                        tool_result = get_adp_data()
 
                     conversation.append({
                         "type": "function_call_output",
