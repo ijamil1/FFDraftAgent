@@ -3,7 +3,7 @@ import json
 import uuid
 import subprocess
 from threading import Thread
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 import itertools, sys, threading, time
 from dotenv import load_dotenv
 from datetime import date
@@ -16,6 +16,8 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 today = date.today()
 season = today.year
 llm_written_files = [] # list of files that the llm has written to the local directory
+max_retries = 5
+backoff = 1  # seconds
 
 # System prompt (configurable via env var AGENT_SYSTEM_PROMPT)
 SYSTEM_PROMPT =  f"You are a fantasy football expert who grounds opinions based on facts and the latest news and projections, and you have taken on the role of a helpful, concise assistant. \
@@ -36,7 +38,6 @@ In additon to having web search enabled, you have access to the following tools:
             If not, let the user know that you will do a web search yourself to scrape the data. Be mindful of the required schema of the adp_csv_file. The csv schema must be: 'Player (str), ADP (float), Position (str)'. 'Position' is one of: QB, RB, WR, TE, K, DST. \
             So, the web search needs to scrape the player name, average draft position (for PPR scoring), and position. It is CRITICAL that the web search retrieves data for AT LEAST 300 players for the upcoming {season} fantasy football season. Each position has a minimum number of players that have to be retrieved: QB: 14, RB: 70, WR: 70, TE: 14, K: 14, DST: 14. Ideally, more than the minimum number of players for each position are retrieved. The simulation may fail otherwise. \
             Get ADP data from one or a combination of reputable sources like ESPN, CBS, Yahoo, and NFL.com, or PFF. If finding ADP is too tricky, you can use PPR rank as a proxy for ADP. You should use the create_file tool to create a new csv file with the adp data. Note, you need to format the data as a csv file but it doesn't need to natively be exported from the web as a csv file.\
-             \
             Choose a relevant filename for the adp_csv_file, write the content, and use the absolute filepath of the file containing the data you just wrote as the adp_csv_file parameter. This path can be found in the status key of the dict returned from the create_file tool. \
             \
     - get_simulation_status_and_results: This function should be used to retrieve the status and/or results of the draft simulation. This function is \
@@ -71,7 +72,7 @@ Instead, your role is to help the user manage large tasks effectively:\
    - Always either (a) finish the requested task, or (b) persist intermediate progress before ending your turn. \
    - If the user has given you a task that is too large for one step, clearly tell them so and suggest a breakdown strategy. \
    - If you must return control before the task is finished, explicitly inform the user that the task is incomplete and how they can continue.\
-Never claim to run tasks in the background. Never silently drop progress."
+NEVER claim to run tasks (other than the simulation) in the background. NEVER silently drop progress."
 # ------------------------------
 # Job Management
 # ------------------------------
@@ -227,8 +228,8 @@ custom_tools = [
             num_teams: Number of teams in the user's league (REQUIRED) \
             pick: The user's draft pick position (REQUIRED) \
             draft_rounds: Number of rounds in the draft (REQUIRED) \
-            adp_csv_file: Absolute filename for player data in CSV format (REQUIRED); the csv schema must be: 'Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order. \
-            keepers_csv_file: Absolute filename for keepers data in CSV format (OPTIONAL). If provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive). \
+            adp_csv_file: *Absolute* file path for player data in CSV format (REQUIRED); the csv schema must be: 'Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order. \
+            keepers_csv_file: *Absolute* file path for keepers data in CSV format (OPTIONAL). If provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive). \
             num_sims: Number of draft simulations to run (OPTIONAL) \
             \
             Ensure that the parameters of this function are extracted from the user's input. If the user is trying to run the simulation without providing the necessary parameters, let them know and ask them to provide the necessary parameters.",
@@ -239,8 +240,8 @@ custom_tools = [
                 "num_teams": {"type": "integer", "description": "Number of teams in the user's league (ie: 14)"},
                 "pick": {"type": "integer", "description": "The user's draft pick position (ie: 1)"},
                 "draft_rounds": {"type": "integer", "description": "Number of rounds in the draft (ie: 14)"},
-                "adp_csv_file": {"type": "string", "description": "Absolute filename for player data in CSV format; the csv schema must be: 'Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order."},
-                "keepers_csv_file": {"type": "string", "description": "Absolute filename for keepers data in CSV format; if provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive)."},
+                "adp_csv_file": {"type": "string", "description": "Absolute file path for player data in CSV format; the csv schema must be: 'Player (str), ADP (float), Position (str)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'ADP' is the average draft position of the player; the data must be sorted by 'ADP' in ascending order."},
+                "keepers_csv_file": {"type": "string", "description": "Absolute file path for keepers data in CSV format; if provided, the csv schema must be: 'Player (str), Position (str), Round (int), Team (int)' where 'Position' is one of: QB, RB, WR, TE, K, DST and 'Round' is the draft round being used to keep the player. 'Team' is the team that the player will be on where Team 1 is the first team to draft and Team 2 is the second team to draft in the first round and so on. 'Team' must be between 1 and num_teams (inclusive)."},
                 "num_sims": {"type": "integer", "description": "Number of draft simulations to run (ie: 2000)"},
             },
             "required": ["num_teams", "pick", "draft_rounds", "adp_csv_file"]
@@ -260,24 +261,12 @@ custom_tools = [
                 Most Likely Top 10 Players Available in Round 1: \
                 Player 1_1, Percentage of simulations available, ADP \
                 Player 2_1, Percentage of simulations available, ADP \
-                Player 3_1, Percentage of simulations available, ADP \
-                Player 4_1, Percentage of simulations available, ADP \
-                Player 5_1, Percentage of simulations available, ADP \
-                Player 6_1, Percentage of simulations available, ADP \
-                Player 7_1, Percentage of simulations available, ADP \
-                Player 8_1, Percentage of simulations available, ADP \
-                Player 9_1, Percentage of simulations available, ADP \
+                ...\
                 Player 10_1, Percentage of simulations available, ADP \
                 Most Likely Top 10 Players Available in Round 2: \
                 Player 1_2, Percentage of simulations available, ADP \
                 Player 2_2, Percentage of simulations available, ADP \
-                Player 3_2, Percentage of simulations available, ADP \
-                Player 4_2, Percentage of simulations available, ADP \
-                Player 5_2, Percentage of simulations available, ADP \
-                Player 6_2, Percentage of simulations available, ADP \
-                Player 7_2, Percentage of simulations available, ADP \
-                Player 8_2, Percentage of simulations available, ADP \
-                Player 9_2, Percentage of simulations available, ADP \
+                ...\
                 Player 10_2, Percentage of simulations available, ADP \
                 Most Likely Top 10 Players Available in Round X: \
                 Keeper used in this round\
@@ -285,13 +274,7 @@ custom_tools = [
                 Most Likely Top 10 Players Available in Round 14: \
                 Player 1_14, Percentage of simulations available, ADP \
                 Player 2_14, Percentage of simulations available, ADP \
-                Player 3_14, Percentage of simulations available, ADP \
-                Player 4_14, Percentage of simulations available, ADP \
-                Player 5_14, Percentage of simulations available, ADP \
-                Player 6_14, Percentage of simulations available, ADP \
-                Player 7_14, Percentage of simulations available, ADP \
-                Player 8_14, Percentage of simulations available, ADP \
-                Player 9_14, Percentage of simulations available, ADP \
+                ...\
                 Player 10_14, Percentage of simulations available, ADP \
                 \
                 ADP: The ADP of the player is the average draft position of the player.\
@@ -396,6 +379,7 @@ def agent_chat(model):
     """)
     
     while True:
+        print('-----------------------------------------------------------------------')
         user_input = input("You: ")
         if user_input.lower() in {"exit", "quit"}:
             break
@@ -409,16 +393,25 @@ def agent_chat(model):
             stop_event = threading.Event()
             t = threading.Thread(target=spinner, args=(stop_event,))
             t.start()
-
+  
             try:
-                response = client.responses.create(
+                for attempt in range(max_retries):
+                    try:
+                        response = client.responses.create(
                             model=model,
                             input=conversation,
                             tools=tools
                         )
+                        break  # success → exit loop
+                    except RateLimitError as e:
+                        wait = backoff * (2 ** attempt)  # exponential backoff
+                        print(f"OpenAI rate limit hit on your key (attempt {attempt+1}). Retrying in {wait:.1f}s...")
+                        time.sleep(wait)
+                else:
+                    raise RuntimeError("Max retries exceeded due to OpenAI rate limiting you. Please try again later.")
             finally:
                 stop_event.set()
-                t.join()            
+                t.join()
             new_tool_call = False
 
             for o in response.output:
@@ -428,6 +421,7 @@ def agent_chat(model):
                     content = "".join(c.text for c in o.content if hasattr(c, 'type') and c.type == 'output_text')
                     if content:
                         print("Agent:", content)
+                        print('\n')
 
                 elif hasattr(o, "type") and o.type == "function_call":
                     new_tool_call = True
