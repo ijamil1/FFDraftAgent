@@ -222,7 +222,7 @@ def main():
         '--num_sims',
         type=int,
         default=3000,
-        help='Number of draft simulations to run (optional; default is 1000)'
+        help='Number of draft simulations to run (optional; default is 3000)'
     )
 
     parser.add_argument(
